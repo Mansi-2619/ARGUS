@@ -1,18 +1,19 @@
-﻿
-import numpy as np
+﻿import numpy as np
 import pandas as pd
 import shap
 
 from src.inference import load_artifacts
 
 
-def _prepare_explanation_data(data, task):
+def _prepare_explanation_data(data, task, model_type="lr"):
     """Apply the exact saved research preprocessing for the selected model."""
 
     if data.empty:
         raise ValueError("No traffic records available.")
 
-    model, scaler, log_features, label_encoder = load_artifacts(task)
+    model, scaler, log_features, label_encoder = load_artifacts(
+        task, model_type
+    )
 
     feature_cols = list(model.feature_names_in_)
 
@@ -31,6 +32,10 @@ def _prepare_explanation_data(data, task):
         raise ValueError("Traffic data contains missing or invalid values.")
 
     # Preserve the verified research log transformation.
+    unknown_log_cols = [c for c in log_features if c not in feature_cols]
+    if unknown_log_cols:
+        raise ValueError("Saved log-feature list does not match the model.")
+
     X.loc[:, log_features] = np.log1p(
         X.loc[:, log_features].clip(lower=0)
     )
@@ -44,39 +49,84 @@ def _prepare_explanation_data(data, task):
     return model, X_scaled, feature_cols, label_encoder
 
 
-def _get_contributions(model, X_scaled, row_index, background_size, class_index=None):
-    """Calculate SHAP contributions for one selected record."""
+def _extract_class_contributions(values, class_index, class_count):
+    """Handle SHAP output formats across SHAP versions."""
 
-    background = X_scaled.head(min(background_size, len(X_scaled)))
+    # Older SHAP versions may return one array per class.
+    if isinstance(values, list):
+        if class_index >= len(values):
+            raise ValueError("SHAP did not return the requested class.")
+        return np.asarray(values[class_index])[0]
 
-    explainer = shap.LinearExplainer(model, background)
-    explanation = explainer(X_scaled.iloc[[row_index]])
+    values = np.asarray(values)
 
-    values = np.asarray(explanation.values)
-
+    # Newer SHAP versions may return:
+    # (records, features, classes)
     if values.ndim == 3:
-        if class_index is None:
-            raise ValueError("A class index is required for multiclass SHAP.")
+        if values.shape[-1] == class_count:
+            return values[0, :, class_index]
 
-        if values.shape[-1] == len(model.classes_):
-            contributions = values[0, :, class_index]
-        elif values.shape[1] == len(model.classes_):
-            contributions = values[0, class_index, :]
-        else:
-            raise ValueError(
-                f"Unexpected SHAP output shape: {values.shape}"
-            )
+        # Alternative layout: (records, classes, features)
+        if values.shape[1] == class_count:
+            return values[0, class_index, :]
 
-    elif values.ndim == 2:
-        contributions = values[0]
-
-    else:
         raise ValueError(f"Unexpected SHAP output shape: {values.shape}")
 
-    return contributions
+    # Binary models can return (records, features).
+    if values.ndim == 2:
+        return values[0]
+
+    raise ValueError(f"Unexpected SHAP output shape: {values.shape}")
 
 
-def _build_result_table(feature_cols, contributions, positive_direction, negative_direction):
+def _get_contributions(
+    model,
+    X_scaled,
+    row_index,
+    background_size,
+    class_index=None,
+    model_type="lr"
+):
+    """Calculate SHAP contributions for one selected record."""
+
+    if model_type == "lr":
+        background = X_scaled.head(
+            min(background_size, len(X_scaled))
+        )
+
+        explainer = shap.LinearExplainer(model, background)
+        explanation = explainer(X_scaled.iloc[[row_index]])
+        values = explanation.values
+
+    elif model_type == "rf":
+        # TreeExplainer uses the trained forest structure directly.
+        # No new scaler or model training is performed.
+        explainer = shap.TreeExplainer(model)
+        values = explainer.shap_values(
+            X_scaled.iloc[[row_index]]
+        )
+
+    else:
+        raise ValueError("Model type must be 'lr' or 'rf'.")
+
+    if class_index is None:
+        raise ValueError("A class index is required for SHAP.")
+
+    contributions = _extract_class_contributions(
+        values,
+        class_index,
+        len(model.classes_)
+    )
+
+    return np.asarray(contributions).reshape(-1)
+
+
+def _build_result_table(
+    feature_cols,
+    contributions,
+    positive_direction,
+    negative_direction
+):
     """Build a consistently structured feature contribution table."""
 
     results = pd.DataFrame({
@@ -98,14 +148,19 @@ def _build_result_table(feature_cols, contributions, positive_direction, negativ
     ).reset_index(drop=True)
 
 
-def explain_record(data, row_index=0, background_size=50):
-    """Explain one binary Logistic Regression prediction using SHAP."""
+def explain_record(
+    data,
+    row_index=0,
+    background_size=50,
+    model_type="lr"
+):
+    """Explain one binary prediction using Logistic Regression or RF SHAP."""
 
     if row_index < 0 or row_index >= len(data):
         raise IndexError("Selected record does not exist.")
 
     model, X_scaled, feature_cols, _ = _prepare_explanation_data(
-        data, "binary"
+        data, "binary", model_type
     )
 
     class_index = list(model.classes_).index(1)
@@ -115,7 +170,8 @@ def explain_record(data, row_index=0, background_size=50):
         X_scaled,
         row_index,
         background_size,
-        class_index
+        class_index,
+        model_type
     )
 
     return _build_result_table(
@@ -126,17 +182,21 @@ def explain_record(data, row_index=0, background_size=50):
     )
 
 
-def explain_multiclass_record(data, row_index=0, background_size=50):
-    """Explain the predicted class of one multiclass Logistic Regression record."""
+def explain_multiclass_record(
+    data,
+    row_index=0,
+    background_size=50,
+    model_type="lr"
+):
+    """Explain the predicted class of one multiclass record."""
 
     if row_index < 0 or row_index >= len(data):
         raise IndexError("Selected record does not exist.")
 
     model, X_scaled, feature_cols, label_encoder = _prepare_explanation_data(
-        data, "multiclass"
+        data, "multiclass", model_type
     )
 
-    # Identify the class predicted for this particular record.
     predicted_encoded = model.predict(
         X_scaled.iloc[[row_index]]
     )[0]
@@ -157,7 +217,8 @@ def explain_multiclass_record(data, row_index=0, background_size=50):
         X_scaled,
         row_index,
         background_size,
-        class_index
+        class_index,
+        model_type
     )
 
     results = _build_result_table(

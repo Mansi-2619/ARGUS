@@ -10,15 +10,19 @@ MODEL_DIR = ROOT / "artifacts" / "models"
 PREPROCESS_DIR = ROOT / "artifacts" / "preprocessing"
 
 
-def load_artifacts(task="binary"):
-    """Load the saved model and its matching preprocessing artifacts."""
+def load_artifacts(task="binary", model_type="lr"):
+    """Load the selected model and its matching preprocessing artifacts."""
 
     if task not in ("binary", "multiclass"):
         raise ValueError("Task must be 'binary' or 'multiclass'.")
 
-    suffix = "_multiclass" if task == "multiclass" else ""
+    if model_type not in ("lr", "rf"):
+        raise ValueError("Model type must be 'lr' or 'rf'.")
 
-    model_path = MODEL_DIR / f"logistic_regression{suffix}.pkl"
+    suffix = "_multiclass" if task == "multiclass" else ""
+    model_name = "logistic_regression" if model_type == "lr" else "random_forest"
+
+    model_path = MODEL_DIR / f"{model_name}{suffix}.pkl"
     scaler_path = PREPROCESS_DIR / f"robust_scaler_{task}.pkl"
     log_path = PREPROCESS_DIR / "log_features.pkl"
 
@@ -34,7 +38,6 @@ def load_artifacts(task="binary"):
     scaler = joblib.load(scaler_path)
     log_features = joblib.load(log_path)
 
-    # Support a list, tuple, set, NumPy array, or dictionary of feature names.
     if isinstance(log_features, dict):
         log_features = list(log_features.keys())
     else:
@@ -49,11 +52,11 @@ def load_artifacts(task="binary"):
     return model, scaler, log_features, encoder
 
 
-def predict_traffic(data, task="binary"):
+def predict_traffic(data, task="binary", model_type="lr"):
     """
-    Predict traffic using the saved Logistic Regression model.
+    Predict traffic using Logistic Regression or Random Forest.
 
-    Input must contain the original 78 CICIDS2017 model features.
+    Input must contain the original 78 CICIDS2017 features.
     Extra columns are ignored.
     """
 
@@ -63,7 +66,7 @@ def predict_traffic(data, task="binary"):
     if data.empty:
         raise ValueError("The uploaded CSV contains no traffic records.")
 
-    model, scaler, log_features, encoder = load_artifacts(task)
+    model, scaler, log_features, encoder = load_artifacts(task, model_type)
 
     feature_cols = list(model.feature_names_in_)
 
@@ -76,13 +79,10 @@ def predict_traffic(data, task="binary"):
 
     X = data.loc[:, feature_cols].copy()
 
-    # Convert features to numeric, then float64 for log transformation.
     for col in feature_cols:
         X[col] = pd.to_numeric(X[col], errors="coerce")
 
     X = X.astype("float64")
-
-   
 
     invalid = X.isna() | ~np.isfinite(X)
     if invalid.any().any():
@@ -96,7 +96,7 @@ def predict_traffic(data, task="binary"):
             f"Please clean the CSV before prediction. Details: {details}"
         )
 
-    # Apply the verified research log transformation.
+    # Preserve the verified research log transformation.
     unknown_log_cols = [c for c in log_features if c not in feature_cols]
     if unknown_log_cols:
         raise ValueError("The saved log-feature list does not match the model.")
@@ -105,8 +105,8 @@ def predict_traffic(data, task="binary"):
         X.loc[:, log_features].clip(lower=0)
     )
 
-    # Use the saved scaler. Never fit a new scaler during inference.
-    X_scaled = scaler.transform(X)
+    # Use the saved task-specific scaler. Never fit a new scaler.
+    X_scaled = pd.DataFrame(scaler.transform(X), columns=feature_cols, index=X.index)
 
     predictions = model.predict(X_scaled)
 
@@ -144,11 +144,9 @@ def predict_traffic(data, task="binary"):
                 f"Class {value}" for value in predictions
             ]
 
-    results["Model"] = (
-        "Logistic Regression - Binary"
-        if task == "binary"
-        else "Logistic Regression - Multiclass"
-    )
+    model_label = "Logistic Regression" if model_type == "lr" else "Random Forest"
+    task_label = "Binary" if task == "binary" else "Multiclass"
+    results["Model"] = f"{model_label} - {task_label}"
 
     return results
 
